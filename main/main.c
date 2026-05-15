@@ -33,6 +33,7 @@
 
 #include "web_server.h"
 #include "qr_code.h"
+#include "tcp_serial.h"
 
 /* ========== 宏定义 ========== */
 #define TAG "PROVISION"
@@ -271,7 +272,6 @@ static void wifi_init_sta(void)
                                                          &instance_got_ip));
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_start());
 
     ESP_LOGI(TAG, "STA模式已启动");
 }
@@ -340,6 +340,7 @@ static void on_wifi_credentials_received(const char *ssid, const char *password)
     if (bits & WIFI_CONNECTED_BIT) {
         ESP_LOGI(TAG, "Wi-Fi连接成功！");
         xEventGroupSetBits(s_wifi_event_group, PROVISION_DONE_BIT);
+        tcp_serial_start(8888);
     } else {
         ESP_LOGE(TAG, "Wi-Fi连接失败，请重新配网");
         // 可以重新启动AP模式让用户重试
@@ -442,6 +443,7 @@ void app_main(void)
         strncpy((char *)sta_config.sta.ssid, saved_ssid, sizeof(sta_config.sta.ssid) - 1);
         strncpy((char *)sta_config.sta.password, saved_password, sizeof(sta_config.sta.password) - 1);
         ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_config));
+        ESP_ERROR_CHECK(esp_wifi_start());
 
         // 等待连接结果
         EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
@@ -451,6 +453,7 @@ void app_main(void)
 
         if (bits & WIFI_CONNECTED_BIT) {
             ESP_LOGI(TAG, "Wi-Fi连接成功！设备已就绪");
+            tcp_serial_start(8888);
         } else {
             ESP_LOGE(TAG, "Wi-Fi连接失败，请长按BOOT键重新配网");
             // 可以在此加入重启进入配网模式的逻辑
