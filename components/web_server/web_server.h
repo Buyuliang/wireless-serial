@@ -9,6 +9,7 @@
  * @param password Wi-Fi密码
  */
 typedef void (*credential_callback_t)(const char *ssid, const char *password);
+typedef void (*ap_control_callback_t)(void);
 
 /**
  * @brief 启动Web配网服务器（含DNS劫持）
@@ -24,6 +25,7 @@ void stop_web_server(void);
  * @brief 设置Wi-Fi凭据回调
  */
 void web_server_set_credential_callback(credential_callback_t callback);
+void web_server_set_ap_close_callback(ap_control_callback_t callback);
 
 /**
  * @brief 扫描附近Wi-Fi（JSON格式返回）

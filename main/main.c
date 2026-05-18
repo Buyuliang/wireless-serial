@@ -45,6 +45,7 @@
 #define WIFI_CONNECTED_BIT      BIT0
 #define WIFI_FAIL_BIT           BIT1
 #define PROVISION_DONE_BIT      BIT2
+#define AP_CLOSE_BIT            BIT3
 
 static EventGroupHandle_t s_wifi_event_group;
 static int s_retry_num = 0;
@@ -70,9 +71,15 @@ static void save_wifi_config(const char *ssid, const char *password);
 static bool check_provision_button(void);
 static void generate_device_identity(void);
 static void provisioning_task(void *pvParameters);
+static void provision_connect_task(void *pvParameters);
 static void on_wifi_credentials_received(const char *ssid, const char *password);
+static void on_ap_close_requested(void);
 static void wifi_event_handler(void *arg, esp_event_base_t event_base,
                                int32_t event_id, void *event_data);
+
+static char s_pending_ssid[64];
+static char s_pending_password[64];
+static bool s_connect_task_running = false;
 
 static bool load_wifi_config(char *ssid, size_t ssid_len, char *password, size_t password_len)
 {
@@ -206,7 +213,7 @@ static void wifi_event_group_prepare(void)
     }
 
     xEventGroupClearBits(s_wifi_event_group,
-                         WIFI_CONNECTED_BIT | WIFI_FAIL_BIT | PROVISION_DONE_BIT);
+                         WIFI_CONNECTED_BIT | WIFI_FAIL_BIT | PROVISION_DONE_BIT | AP_CLOSE_BIT);
 }
 
 static void wifi_stack_init(void)
@@ -291,6 +298,7 @@ static void start_provisioning_mode(void)
 {
     s_is_provisioning = true;
     web_server_set_credential_callback(on_wifi_credentials_received);
+    web_server_set_ap_close_callback(on_ap_close_requested);
 
     esp_err_t err = esp_wifi_stop();
     if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_INIT && err != ESP_ERR_WIFI_NOT_STARTED) {
@@ -301,26 +309,36 @@ static void start_provisioning_mode(void)
     start_web_server();
 }
 
-static void on_wifi_credentials_received(const char *ssid, const char *password)
+static void provision_connect_task(void *pvParameters)
 {
-    ESP_LOGI(TAG, "Received Wi-Fi config: SSID=%s", ssid);
+    (void)pvParameters;
+
+    char ssid[sizeof(s_pending_ssid)] = {0};
+    char password[sizeof(s_pending_password)] = {0};
+
+    strncpy(ssid, s_pending_ssid, sizeof(ssid) - 1);
+    strncpy(password, s_pending_password, sizeof(password) - 1);
+
+    ESP_LOGI(TAG, "Connecting STA while keeping provisioning AP active...");
 
     save_wifi_config(ssid, password);
 
-    ESP_LOGI(TAG, "Switching from AP mode to STA mode...");
-
-    ESP_ERROR_CHECK(esp_wifi_stop());
     s_sta_should_connect = true;
     s_retry_num = 0;
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
 
     wifi_config_t sta_config = {0};
     strncpy((char *)sta_config.sta.ssid, ssid, sizeof(sta_config.sta.ssid) - 1);
     strncpy((char *)sta_config.sta.password, password, sizeof(sta_config.sta.password) - 1);
 
     xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT);
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
+
+    esp_err_t err = esp_wifi_disconnect();
+    if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_CONNECT) {
+        ESP_ERROR_CHECK(err);
+    }
+    ESP_ERROR_CHECK(esp_wifi_connect());
 
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
                                            WIFI_CONNECTED_BIT | WIFI_FAIL_BIT,
@@ -328,13 +346,48 @@ static void on_wifi_credentials_received(const char *ssid, const char *password)
                                            pdMS_TO_TICKS(WIFI_CONNECT_TIMEOUT_MS));
 
     if (bits & WIFI_CONNECTED_BIT) {
-        ESP_LOGI(TAG, "Wi-Fi connected");
+        ESP_LOGI(TAG, "Wi-Fi connected, provisioning AP stays active until user closes it");
         xEventGroupSetBits(s_wifi_event_group, PROVISION_DONE_BIT);
         tcp_serial_start(8888);
     } else {
-        ESP_LOGE(TAG, "Wi-Fi connect failed, returning to provisioning mode");
-        start_provisioning_mode();
+        ESP_LOGE(TAG, "Wi-Fi connect failed, provisioning AP remains active");
     }
+
+    s_connect_task_running = false;
+    vTaskDelete(NULL);
+}
+
+static void on_wifi_credentials_received(const char *ssid, const char *password)
+{
+    ESP_LOGI(TAG, "Received Wi-Fi config: SSID=%s", ssid);
+
+    if (s_connect_task_running) {
+        ESP_LOGW(TAG, "Provisioning connect already in progress, ignore duplicate request");
+        return;
+    }
+
+    strncpy(s_pending_ssid, ssid, sizeof(s_pending_ssid) - 1);
+    s_pending_ssid[sizeof(s_pending_ssid) - 1] = 0;
+    strncpy(s_pending_password, password, sizeof(s_pending_password) - 1);
+    s_pending_password[sizeof(s_pending_password) - 1] = 0;
+
+    s_connect_task_running = true;
+    BaseType_t ret = xTaskCreate(provision_connect_task, "prov_connect", 8192, NULL, 5, NULL);
+    if (ret != pdPASS) {
+        s_connect_task_running = false;
+        ESP_LOGE(TAG, "Failed to create provisioning connect task");
+    }
+}
+
+static void on_ap_close_requested(void)
+{
+    if (!s_is_provisioning) {
+        ESP_LOGW(TAG, "Ignore AP close request while not in provisioning mode");
+        return;
+    }
+
+    ESP_LOGI(TAG, "User requested to close provisioning AP");
+    xEventGroupSetBits(s_wifi_event_group, AP_CLOSE_BIT);
 }
 
 static void provisioning_task(void *pvParameters)
@@ -354,15 +407,26 @@ static void provisioning_task(void *pvParameters)
 
     qr_code_print(qr_data);
 
-    xEventGroupWaitBits(s_wifi_event_group,
-                        PROVISION_DONE_BIT,
-                        pdFALSE, pdFALSE,
-                        portMAX_DELAY);
+    while (true) {
+        EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
+                                               PROVISION_DONE_BIT | AP_CLOSE_BIT,
+                                               pdTRUE, pdFALSE,
+                                               portMAX_DELAY);
 
-    ESP_LOGI(TAG, "Provisioning completed");
+        if (bits & PROVISION_DONE_BIT) {
+            ESP_LOGI(TAG, "Provisioning connected, AP remains active until user closes it");
+        }
 
+        if (bits & AP_CLOSE_BIT) {
+            break;
+        }
+    }
+
+    ESP_LOGI(TAG, "Closing provisioning AP and switching to STA-only mode");
     stop_web_server();
     s_is_provisioning = false;
+    s_sta_should_connect = true;
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     vTaskDelete(NULL);
 }
 
@@ -401,6 +465,7 @@ void app_main(void)
 
         s_is_provisioning = true;
         web_server_set_credential_callback(on_wifi_credentials_received);
+        web_server_set_ap_close_callback(on_ap_close_requested);
         xTaskCreate(provisioning_task, "provision_task", 8192, NULL, 5, NULL);
     } else {
         ESP_LOGI(TAG, "Connecting with saved Wi-Fi config: %s", saved_ssid);
